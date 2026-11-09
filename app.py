@@ -1,26 +1,122 @@
-# app.py
-import streamlit as st
-import pandas as pd
+# app.py  (self-contained: loads data, trains the model if needed, runs the UI)
+import io
+import os
+import urllib.request
+import zipfile
+
 import joblib
+import pandas as pd
+import streamlit as st
+from sklearn.compose import ColumnTransformer
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.impute import SimpleImputer
+from sklearn.model_selection import train_test_split
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
 st.set_page_config(page_title="Student Predict", page_icon="🎓", layout="wide")
 
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_PATH = os.path.join(BASE_DIR, "student_data.csv")
+MODEL_PATH = os.path.join(BASE_DIR, "student_model.pkl")
+ZIP_URL = "https://archive.ics.uci.edu/static/public/320/student+performance.zip"
 
-@st.cache_resource
-def load_model():
-    return joblib.load("student_model.pkl")
+
+def _find_math(raw_bytes):
+    """Look for student-mat.csv inside the (possibly nested) UCI zip."""
+    with zipfile.ZipFile(io.BytesIO(raw_bytes)) as z:
+        for name in z.namelist():
+            if name.endswith("student-mat.csv"):
+                return pd.read_csv(z.open(name), sep=";")
+        for name in z.namelist():
+            if name.endswith(".zip"):
+                found = _find_math(z.read(name))
+                if found is not None:
+                    return found
+    return None
+
+
+def load_data():
+    """Use student_data.csv if present; otherwise download it from UCI."""
+    if os.path.exists(DATA_PATH):
+        return pd.read_csv(DATA_PATH)
+    df = None
+    try:
+        with urllib.request.urlopen(ZIP_URL, timeout=60) as resp:
+            df = _find_math(resp.read())
+    except Exception:
+        df = None
+    if df is None:  # fallback: ucimlrepo package
+        from ucimlrepo import fetch_ucirepo
+
+        student = fetch_ucirepo(id=320)
+        df = pd.concat([student.data.features, student.data.targets], axis=1)
+    df.to_csv(DATA_PATH, index=False)
+    return df
+
+
+def train_model(df):
+    """Same pipeline as train_model.py (G3 is the target only, never a feature)."""
+    df = df.drop_duplicates()
+    y = (df["G3"] < 10).astype(int)
+    X = df.drop(columns=["G3"])
+    numeric_cols = X.select_dtypes(include="number").columns.tolist()
+    categorical_cols = X.select_dtypes(exclude="number").columns.tolist()
+
+    preprocessor = ColumnTransformer([
+        ("numeric", Pipeline([
+            ("imputer", SimpleImputer(strategy="median")),
+            ("scaler", StandardScaler()),
+        ]), numeric_cols),
+        ("categorical", Pipeline([
+            ("imputer", SimpleImputer(strategy="most_frequent")),
+            ("encoder", OneHotEncoder(handle_unknown="ignore")),
+        ]), categorical_cols),
+    ])
+    X_train, _, y_train, _ = train_test_split(
+        X, y, test_size=0.20, random_state=42, stratify=y
+    )
+    model = Pipeline([
+        ("preprocessor", preprocessor),
+        ("classifier", RandomForestClassifier(
+            n_estimators=100, random_state=42, class_weight="balanced"
+        )),
+    ])
+    model.fit(X_train, y_train)
+    joblib.dump(model, MODEL_PATH)
+    return model
+
+
+@st.cache_resource(show_spinner="Preparing model (first run only, please wait)...")
+def prepare():
+    data = load_data()
+    expected = [c for c in data.columns if c != "G3"]
+    model = None
+    if os.path.exists(MODEL_PATH):
+        try:
+            model = joblib.load(MODEL_PATH)
+            if sorted(model.feature_names_in_) != sorted(expected):
+                model = None
+        except Exception:
+            model = None
+    if model is None:
+        model = train_model(data)
+    return model, data
 
 
 try:
-    model = load_model()
-    data = pd.read_csv("student_data.csv")
-except FileNotFoundError:
-    st.error("student_model.pkl or student_data.csv not found. Run `python train_model.py` first.")
+    model, data = prepare()
+except Exception as exc:
+    st.error("Could not prepare the model. Details below - please send a screenshot.")
+    st.exception(exc)
     st.stop()
 
 st.title("🎓 Student Performance Prediction")
-st.caption("Classroom prototype for academic risk exploration")
-st.info("Predictions are not diagnoses and must not be the sole basis for real student decisions.")
+st.caption("Classroom prototype for academic risk exploration  |  app version v3")
+st.warning(
+    "Predictions are not diagnoses and must not be used as the sole basis "
+    "for real student decisions."
+)
 
 c1, c2, c3 = st.columns(3)
 c1.metric("Records", len(data))
@@ -60,7 +156,6 @@ if uploaded is not None:
         st.subheader("Prediction results")
         st.dataframe(results, use_container_width=True)
         st.metric("Predicted at-risk records", int((predictions == 1).sum()))
-
         st.download_button(
             "Download prediction results",
             results.to_csv(index=False),
